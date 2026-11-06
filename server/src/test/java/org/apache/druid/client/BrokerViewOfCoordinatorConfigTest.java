@@ -125,6 +125,75 @@ public class BrokerViewOfCoordinatorConfigTest
     Assertions.assertTrue(hosts.contains("host2"), "host2 is unrelated, should remain");
   }
 
+  @Test
+  public void testTurboLoadingServersAreFiltered()
+  {
+    target = new BrokerViewOfCoordinatorConfig(coordinatorClient, true);
+    target.start();
+    target.setDynamicConfig(CoordinatorDynamicConfig.builder().withTurboLoadingNodes(Set.of("host1")).build());
+
+    Int2ObjectRBTreeMap<Set<QueryableDruidServer>> servers = makeServers("host1", "host2");
+
+    Int2ObjectRBTreeMap<Set<QueryableDruidServer>> result =
+        target.getQueryableServers(servers, CloneQueryMode.INCLUDECLONES);
+
+    Assertions.assertEquals(Set.of("host2"), extractHosts(result));
+  }
+
+  @Test
+  public void testTurboLoadingServersAreQueriedIfNoOtherServer()
+  {
+    target = new BrokerViewOfCoordinatorConfig(coordinatorClient, true);
+    target.start();
+    target.setDynamicConfig(CoordinatorDynamicConfig.builder().withTurboLoadingNodes(Set.of("host1")).build());
+
+    Int2ObjectRBTreeMap<Set<QueryableDruidServer>> servers = makeServers("host1");
+
+    Int2ObjectRBTreeMap<Set<QueryableDruidServer>> result =
+        target.getQueryableServers(servers, CloneQueryMode.INCLUDECLONES);
+
+    Assertions.assertEquals(Set.of("host1"), extractHosts(result));
+  }
+
+  @Test
+  public void testTurboLoadingServersWithCloneServers()
+  {
+    target = new BrokerViewOfCoordinatorConfig(coordinatorClient, true);
+    target.start();
+    target.setDynamicConfig(
+        CoordinatorDynamicConfig.builder()
+                                .withCloneServers(Map.of("host1", "host2"))
+                                .withTurboLoadingNodes(Set.of("host2"))
+                                .build()
+    );
+
+    Int2ObjectRBTreeMap<Set<QueryableDruidServer>> servers = makeServers("host1", "host2", "host3");
+
+    Assertions.assertEquals(
+        Set.of("host3"),
+        extractHosts(target.getQueryableServers(servers, CloneQueryMode.EXCLUDECLONES))
+    );
+
+    Assertions.assertEquals(
+        Set.of("host2"),
+        extractHosts(target.getQueryableServers(makeServers("host1", "host2"), CloneQueryMode.EXCLUDECLONES))
+    );
+  }
+
+  @Test
+  public void testTurboLoadingServersAreNotFilteredByDefault()
+  {
+    target.start();
+    target.setDynamicConfig(CoordinatorDynamicConfig.builder().withTurboLoadingNodes(Set.of("host1")).build());
+
+    Int2ObjectRBTreeMap<Set<QueryableDruidServer>> servers = makeServers("host1", "host2");
+
+    Int2ObjectRBTreeMap<Set<QueryableDruidServer>> result =
+        target.getQueryableServers(servers, CloneQueryMode.INCLUDECLONES);
+
+    Assertions.assertEquals(Set.of("host1", "host2"), extractHosts(result));
+  }
+
   /**
    * Creates a priority-to-servers map with all servers at priority 0.
    *

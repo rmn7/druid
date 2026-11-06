@@ -19,6 +19,7 @@
 
 package org.apache.druid.client;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableSet;
 import com.google.inject.Inject;
 import it.unimi.dsi.fastutil.ints.Int2ObjectRBTreeMap;
@@ -35,24 +36,43 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
- * Broker view of the coordinator dynamic configuration, and its derived values such as target and source clone servers.
+ * Broker view of the coordinator dynamic configuration, and its derived values such as target and source clone servers
+ * and turbo loading servers.
  * This class is registered as a managed lifecycle to fetch the coordinator dynamic configuration on startup. Further
  * updates are handled through {@link BrokerDynamicConfigResource}.
  */
 public class BrokerViewOfCoordinatorConfig extends BaseBrokerViewOfConfig<CoordinatorDynamicConfig> implements HistoricalFilter
 {
   private final CoordinatorClient coordinatorClient;
+  private final boolean preferNonTurboLoadingServers;
 
   // volatile, not synchronized: getCurrentServersToIgnore() is called per-segment during query planning.
   // Under high concurrency, synchronized causes monitor convoy with 100x throughput degradation.
   // Each field is an immutable Set reference, so volatile provides sufficient visibility.
   private volatile Set<String> targetCloneServers = Set.of();
   private volatile Set<String> sourceCloneServers = Set.of();
+  private volatile Set<String> turboLoadingServers = Set.of();
 
   @Inject
+  public BrokerViewOfCoordinatorConfig(
+      final CoordinatorClient coordinatorClient,
+      final BrokerSegmentWatcherConfig segmentWatcherConfig
+  )
+  {
+    this(coordinatorClient, segmentWatcherConfig.isPreferNonTurboLoadingServers());
+  }
+
+  @VisibleForTesting
   public BrokerViewOfCoordinatorConfig(CoordinatorClient coordinatorClient)
   {
+    this(coordinatorClient, false);
+  }
+
+  @VisibleForTesting
+  public BrokerViewOfCoordinatorConfig(CoordinatorClient coordinatorClient, boolean preferNonTurboLoadingServers)
+  {
     this.coordinatorClient = coordinatorClient;
+    this.preferNonTurboLoadingServers = preferNonTurboLoadingServers;
   }
 
   @Override
@@ -69,7 +89,7 @@ public class BrokerViewOfCoordinatorConfig extends BaseBrokerViewOfConfig<Coordi
 
   /**
    * Update the config view with a new coordinator dynamic config snapshot. Also updates the source and target clone
-   * servers based on the new dynamic configuration.
+   * servers and the turbo loading servers based on the new dynamic configuration.
    */
   @Override
   public void setDynamicConfig(@NotNull CoordinatorDynamicConfig updatedConfig)
@@ -78,16 +98,40 @@ public class BrokerViewOfCoordinatorConfig extends BaseBrokerViewOfConfig<Coordi
     final Map<String, String> cloneServers = updatedConfig.getCloneServers();
     this.targetCloneServers = ImmutableSet.copyOf(cloneServers.keySet());
     this.sourceCloneServers = ImmutableSet.copyOf(cloneServers.values());
+    this.turboLoadingServers = ImmutableSet.copyOf(updatedConfig.getTurboLoadingNodes());
   }
 
+  /**
+   * Filters out servers based on the cloneQueryMode. If
+   * {@link BrokerSegmentWatcherConfig#isPreferNonTurboLoadingServers()} is enabled, also filters out servers in turbo
+   * loading mode, unless they are the only servers left, so that turbo loading servers are queried only as a last
+   * resort.
+   */
   @Override
   public Int2ObjectRBTreeMap<Set<QueryableDruidServer>> getQueryableServers(
       Int2ObjectRBTreeMap<Set<QueryableDruidServer>> historicalServers,
       CloneQueryMode mode
   )
   {
-    final Set<String> serversToIgnore = getCurrentServersToIgnore(mode);
+    final Int2ObjectRBTreeMap<Set<QueryableDruidServer>> queryableServers =
+        filterServers(historicalServers, getCurrentServersToIgnore(mode));
 
+    if (!preferNonTurboLoadingServers) {
+      return queryableServers;
+    }
+
+    final Int2ObjectRBTreeMap<Set<QueryableDruidServer>> nonTurboServers =
+        filterServers(queryableServers, turboLoadingServers);
+
+    final boolean onlyTurboLoadingServersAvailable = nonTurboServers.values().stream().allMatch(Set::isEmpty);
+    return onlyTurboLoadingServersAvailable ? queryableServers : nonTurboServers;
+  }
+
+  private static Int2ObjectRBTreeMap<Set<QueryableDruidServer>> filterServers(
+      Int2ObjectRBTreeMap<Set<QueryableDruidServer>> historicalServers,
+      Set<String> serversToIgnore
+  )
+  {
     if (serversToIgnore.isEmpty()) {
       return historicalServers;
     }
